@@ -1,3 +1,5 @@
+from __future__ import annotations
+import contextlib
 from datetime import datetime
 from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
@@ -343,12 +345,14 @@ class Section:
 
 @dataclass
 class ImportLookupTableEntry:
+    parent: IData
     import_by_ordinal: bool
     ordinal: int | None
     hint_name_table_rva: int | None
+    _hint_name: tuple[int, str] = field(default=None, repr=False, init=False)
 
     @classmethod
-    def from_bytes(cls, byte_input: bytes):
+    def from_bytes(cls, parent: IData, byte_input: bytes):
         assert len(byte_input) in (4, 8)
         import_by_ordinal = bool(byte_input[-2])
         if import_by_ordinal:
@@ -359,14 +363,32 @@ class ImportLookupTableEntry:
             rva = _little_endian(byte_input[0:4])
 
         return cls(
+            parent=parent,
             import_by_ordinal=import_by_ordinal,
             ordinal=ordinal,
             hint_name_table_rva = rva,
         )
 
+    def _read_hint_name(self) -> tuple[int, str]:
+        with self.parent.pefile.open_file_handle():
+            self.parent.pefile.seek(rva=self.hint_name_table_rva)
+            hint = _little_endian(self.parent.pefile.read(2))
+            name = _extract_ascii_string(self.parent.pefile, rva=self.hint_name_table_rva + 2)
+        self._hint_name = hint, name
+        return self._hint_name
+
+    @cached_property
+    def hint(self) -> int:
+        return self._hint_name[0] if self._hint_name else self._read_hint_name()[0]
+
+    @cached_property
+    def symbol(self) -> str:
+        return self._hint_name[1] if self._hint_name else self._read_hint_name()[1]
+
 
 @dataclass
 class ImportDirectoryEntry:
+    parent: IData
     lookup_table_rva: int
     datetime_stamp: datetime
     forwarder_chain: int
@@ -374,9 +396,10 @@ class ImportDirectoryEntry:
     address_table_rva: int
 
     @classmethod
-    def from_bytes(cls, bytes_input):
+    def from_bytes(cls, parent: IData, bytes_input: bytes):
         decoder = _BytesDecoder(bytes_input)
         return cls(
+            parent=parent,
             lookup_table_rva=decoder.next(4),
             datetime_stamp=datetime.fromtimestamp(decoder.next(4)),
             forwarder_chain=decoder.next(4),
@@ -384,26 +407,54 @@ class ImportDirectoryEntry:
             address_table_rva=decoder.next(4)
         )
 
+    @cached_property
+    def name(self):
+        with self.parent.pefile.open_file_handle():
+            name = _extract_ascii_string(self.parent.pefile, rva=self.name_rva)
+        return name
+
+
+@dataclass
+class IData:
+    pefile: PEFile
+    directory_table: list[ImportDirectoryEntry]
+    import_lookup_table: list[list[ImportLookupTableEntry]]
+
+    @classmethod
+    def from_pefile(cls, pefile: PEFile):
+        instance = cls(pefile, [], [])
+        with pefile.open_file_handle():
+            pefile.seek(rva=pefile.optional_header.data_directories.imports.address)
+            while (entry := ImportDirectoryEntry.from_bytes(instance, pefile.read(20))).name_rva:
+                instance.directory_table.append(entry)
+
+            entry_size = 8 if pefile.optional_header.is64bit else 4
+            for directory in instance.directory_table:
+                inner_lookup = []
+                pefile.seek(rva=directory.lookup_table_rva)
+                while int.from_bytes(lookup_entry := pefile.read(entry_size), "little"):
+                    inner_lookup.append(ImportLookupTableEntry.from_bytes(instance, lookup_entry))
+                instance.import_lookup_table.append(inner_lookup)
+
+        return instance
+
 
 class PEFile:
 
     def __init__(self, lib: Path):
-        handle = open(lib, "rb")
-        handle.seek(COFF_HEADER_POINTER_OFFSET)
-        header_offset = _little_endian(handle.read(COFF_HEADER_POINTER_SIZE))
-        handle.seek(header_offset)
-        signature = handle.read(4)
-        if not signature == b"PE\x00\x00":
-            handle.close()
-            raise ValueError("Did not find the correct signature at the start of the header.\n"
-                             "The provided binary is not a valid Windows PE file.")
-        self.handle = handle
-        self.coff_header = COFFHeader.from_bytes(handle.read(COFF_HEADER_BYTE_SIZE))
-        self.optional_header = OptionalHeader.from_bytes(handle.read(self.coff_header.size_of_optional_header))
-        self.sections = {(section := Section.from_bytes(handle.read(40))).name: section for _ in range(self.coff_header.number_of_sections)}
-
-    def __del__(self):
-        self.handle.close()
+        self.file = lib
+        with self.open_file_handle() as handle:
+            handle.seek(COFF_HEADER_POINTER_OFFSET)
+            header_offset = _little_endian(handle.read(COFF_HEADER_POINTER_SIZE))
+            handle.seek(header_offset)
+            signature = handle.read(4)
+            if not signature == b"PE\x00\x00":
+                handle.close()
+                raise ValueError("Did not find the correct signature at the start of the header.\n"
+                                 "The provided binary is not a valid Windows PE file.")
+            self.coff_header = COFFHeader.from_bytes(handle.read(COFF_HEADER_BYTE_SIZE))
+            self.optional_header = OptionalHeader.from_bytes(handle.read(self.coff_header.size_of_optional_header))
+            self.sections = {(section := Section.from_bytes(handle.read(40))).name: section for _ in range(self.coff_header.number_of_sections)}
 
     @cached_property
     def idata(self):
@@ -417,41 +468,47 @@ class PEFile:
         delta = rva - containing_section.virtual_address
         return containing_section.pointer_to_raw_data + delta
 
+    @contextlib.contextmanager
+    def open_file_handle(self):
+        try:
+            if not hasattr(self, "_handle") or not self._handle:
+                self._handle = [open(self.file, "rb")]
+            else:
+                self._handle.append(None)
+            yield self._handle[0]
+        finally:
+            if len(self._handle) == 1:
+                self._handle[0].close()
+                self._handle = None
+            else:
+                self._handle.pop()
+
+
     def seek(self, *, rva: int = 0, offset: int = 0) -> None:
         if not rva ^ offset:
             raise ValueError("Either rva or offset must be specified")
+        if self._handle is None:
+            raise ValueError("No open handle to the PE file on disk.\n"
+                             "Please make sure to only use this method within a 'open_file_handle' context.")
         if rva:
             offset = self.rva_to_file_offset(rva)
-        self.handle.seek(offset)
+        self._handle[0].seek(offset)
 
     def read(self, size: int) -> bytes:
-        return self.handle.read(size)
+        if self._handle is None:
+            raise ValueError("No open handle to the PE file on disk.\n"
+                             "Please make sure to only use this method within a 'open_file_handle' context.")
+        return self._handle[0].read(size)
 
 
-@dataclass
-class IData:
-    directory_table: list[ImportDirectoryEntry]
-    import_lookup_table: list[list[ImportLookupTableEntry]]
-
-    @classmethod
-    def from_pefile(cls, pefile: PEFile):
-        pefile.seek(rva=pefile.optional_header.data_directories.imports.address)
-        directories = []
-        while (entry := ImportDirectoryEntry.from_bytes(pefile.read(20))).name_rva:
-            directories.append(entry)
-
-        lookups = []
-        entry_size = 8 if pefile.optional_header.is64bit else 4
-        for directory in directories:
-            inner_lookup = []
-            pefile.seek(rva=directory.lookup_table_rva)
-            while int.from_bytes(lookup_entry := pefile.read(entry_size), "little"):
-                inner_lookup.append(ImportLookupTableEntry.from_bytes(lookup_entry))
-            lookups.append(inner_lookup)
-
-        return cls(directory_table=directories, import_lookup_table=lookups)
-
-
-def get_dependencies(lib: Path):
+def get_dependencies(lib: Path) -> list[str]:
     file = PEFile(lib)
-    return [_extract_ascii_string(file, rva=entry.name_rva)  for entry in file.idata.directory_table]
+    with file.open_file_handle():
+        deps =  [_extract_ascii_string(file, rva=entry.name_rva)  for entry in file.idata.directory_table]
+    return deps
+
+def get_imported_symbols(lib: Path) -> dict[str, list[str]]:
+    file = PEFile(lib)
+    with file.open_file_handle():
+        symbols = {dll.name: [entry.symbol for entry in lookup_entries] for dll, lookup_entries in zip(file.idata.directory_table, file.idata.import_lookup_table)}
+    return symbols
